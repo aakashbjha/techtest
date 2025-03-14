@@ -1,0 +1,569 @@
+import os
+from datetime import timedelta, datetime
+import sqlite3
+import uuid
+import random
+pip install numpy
+!pip install --upgrade pandas
+!pip install pandasql
+import numpy as np
+import pandas as pd
+import pandasql as ps
+
+
+os.getcwd()
+os.chdir('C:/Users/Aakash.Jha/Downloads/SDS_techTest_Feb2025/SDS_techTest_Oct2024')
+# Specifying the path to our .db file
+db_path = "techTest.db"
+# Connection to the database
+conn = sqlite3.connect(db_path)
+# Create a cursor object to execute SQL queries
+cursor = conn.cursor()
+# Fetching all tables
+cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+tables = cursor.fetchall()
+print("Tables:", tables)
+# Lets load the tables into dataframes and use the pandas package now
+df_patient = pd.read_sql_query("SELECT * FROM patient;", conn)
+df_diagnosis = pd.read_sql_query("SELECT * FROM diagnosis;", conn)
+df_biomarker = pd.read_sql_query("SELECT * FROM biomarker;", conn)
+# Display the first few rows
+print(df_patient.head())
+print(df_diagnosis.head())
+print(df_biomarker.head())
+# Checking basic info
+print(df_patient.info())
+print(df_diagnosis.info())
+print(df_biomarker.info())
+# Missing values
+print(df_patient.isnull().sum())
+print(df_diagnosis.isnull().sum())
+print(df_biomarker.isnull().sum())
+# Summary stats
+print(df_patient.describe())
+print(df_diagnosis.describe())
+print(df_biomarker.describe())
+# Let's start
+# 1. Data maturity 
+#    - Calculate the summary statistics and plot the distribution of follow up time for BC patients.
+#    - Calculate the summary statistics and plot the distribution of age at initial diagnosis for BC patients
+
+## Business Rules
+
+#* Breast cancer patients: Patients with an encounter in the diagnosis table with diagnosis_code matching regex pattern '^C50.*'
+#
+#* Initial diagnosis date: The earliest encounter in the diagnosis table with the relevant filters.
+#
+#* Follow up time: The duration of time between the initial diagnosis date and last encounter in the database for a given patient.
+#
+#* Intent to test rate: The percentage of patients who have an encounter in the biomarker table for the relevant biomarker. 
+#
+#* Tested rate: The percentage of patients who have an encounter in the biomarker table for the relevant biomarker with a valid test result.
+#
+#* Negativity rate: The percentage of patients who have an encounter in the biomarker table for the relevant biomarker with a negative result.
+# First lets find the first instance of Breast cancer diagnosis for patients
+# Join the patient and diagnosis tables to find all patients with Breast Cancer Diagnosis
+
+
+query = """
+SELECT a.*, b.diagnosis_code, DATE(b.diagnosis_date) as diagnosis_date
+FROM patient a
+INNER JOIN diagnosis b
+ON a.patient_id = b.patient_id
+AND b.diagnosis_code like 'C50%'
+ORDER BY a.patient_id, b.diagnosis_date ASC;
+"""
+df_patients_with_BC = pd.read_sql_query(query, conn)
+# Lets perform some EDA on this table
+print(df_patients_with_BC.describe())
+print(df_patients_with_BC['diagnosis_code'].value_counts())
+print(df_patients_with_BC['gender'].value_counts())
+# Lets see whats the range of diagnosis date we have here
+print(df_patients_with_BC['diagnosis_date'].min())
+print(df_patients_with_BC['diagnosis_date'].max())
+
+
+# Finding the first diagnosis of BC for each patient
+query = """
+SELECT *
+FROM
+(
+Select *,
+       rank() OVER (PARTITION BY patient_id ORDER BY diagnosis_date ASC) AS rnk
+FROM df_patients_with_BC 
+)
+WHERE rnk = 1
+"""
+
+df_first_diag_of_BC = ps.sqldf(query, locals())
+print(df_first_diag_of_BC.describe(include='all'))
+#EDA
+print(df_first_diag_of_BC['gender'].value_counts())
+print(df_first_diag_of_BC['dod'].value_counts())
+
+
+query = """
+SELECT *, CASE WHEN dob > dod THEN 1 ELSE 0 end as dob_anom,
+          CASE WHEN diagnosis_date > DATE(dod) THEN 1 ELSE 0 end as diag_anom
+FROM
+df_first_diag_of_BC
+WHERE dod < dob
+OR DATE(dod) < diagnosis_date
+"""
+df_first_diag_of_BC_check = ps.sqldf(query, locals())
+print(df_first_diag_of_BC_check.describe(include='all'))
+print(df_first_diag_of_BC_check['diag_anom'].value_counts())
+
+
+# Excluding patients who had a date of death prior to their first diagnosis
+query = """
+SELECT *
+FROM
+df_first_diag_of_BC
+WHERE patient_id not in (SELECT distinct patient_id from df_first_diag_of_BC_check);
+"""
+df_first_diag_of_BC_filtered_dod = ps.sqldf(query, locals())
+print(df_first_diag_of_BC_filtered_dod.describe(include='all'))
+
+
+# Calculating followup time
+# To find that out lets look at the final encounter for each patient, lets join all the tables
+query = """
+SELECT a.*, DATE(b.diagnosis_date) as diagnosis_date,
+       DATE(c.test_date) as test_date
+FROM patient a
+INNER JOIN diagnosis b
+ON a.patient_id = b.patient_id
+INNER JOIN biomarker c
+ON a.patient_id = c.patient_id;
+"""
+df_all_tables = pd.read_sql_query(query, conn)
+print(df_all_tables.describe(include='all'))
+query = """
+SELECT patient_id,
+       max(DATE(dod)) as max_dod,
+       max(diagnosis_date) as max_diag,
+       max(test_date) as max_test
+       
+       
+FROM df_all_tables 
+GROUP BY 1;
+"""
+df_last_encounter = ps.sqldf(query, locals())
+query = """
+SELECT *,
+       CASE
+           WHEN max_diag >= max_dod OR max_test >= max_dod THEN max_dod
+           WHEN max_diag <= max_dod AND max_diag >= max_test THEN max_diag
+           WHEN max_test <= max_dod AND max_test >= max_diag THEN max_test
+           ELSE '9999-01-01'
+       END AS last_encounter_dod
+       
+       
+FROM df_last_encounter 
+GROUP BY 1;
+"""
+df_last_encounter_final = ps.sqldf(query, locals())
+print(df_last_encounter_final.describe(include='all'))
+print(df_last_encounter_final['last_encounter_dod'].value_counts().sort_index())
+print(df_last_encounter_final)
+
+
+# Joining the last encounter to our final table post exclusions and calculating followup period
+query = """
+SELECT a.*,
+       b.last_encounter_dod,
+       (b.last_encounter_dod - a.diagnosis_date)*12 as followup_time
+       
+FROM df_first_diag_of_BC_filtered_dod a
+INNER JOIN df_last_encounter_final b
+ON a.patient_id = b.patient_id;
+"""
+df_followup_time = ps.sqldf(query, locals())
+print(df_followup_time)
+print(df_followup_time.describe(include='all'))
+print(df_followup_time[['patient_id', 'last_encounter_dod', 'diagnosis_date', 'followup_time']].sort_values(by='followup_time'))
+
+
+#****1*****
+#Summary stat for followup time variable
+print(df_followup_time['followup_time'].describe())
+# Plotting the time to event variable
+!pip install --upgrade seaborn
+!pip install matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+plt.figure(figsize=(8, 5))
+sns.histplot(df_followup_time['followup_time'], bins=30, kde=True)
+plt.title("Distribution of followup time Variable")
+plt.xlabel("Followup time (months)")
+plt.ylabel("Patients")
+plt.show()
+
+
+#Calculating age at initial diagnosis
+print(df_followup_time.describe(include='all'))
+query = """
+SELECT *,
+       diagnosis_date - DATE(dob) as Age
+
+    
+FROM df_followup_time;
+"""
+df_age = ps.sqldf(query, locals())
+print(df_age.describe(include='all'))
+print(df_age['Age'].describe())
+plt.figure(figsize=(8, 5))
+sns.histplot(df_age['Age'], bins=30, kde=True)
+plt.title("Distribution of Age")
+plt.xlabel("Age (Years)")
+plt.ylabel("Patients")
+plt.show()
+
+
+# ******2*******
+# Calculate the intent to test rate for HER2.
+# Join patient and biomarker table
+print(df_biomarker.describe())
+query = """
+SELECT a.*, 
+       DATE(b.test_date) as test_date,
+       b.biomarker_name,
+       b.biomarker_test_type,
+       b.test_result
+FROM patient a
+INNER JOIN biomarker b
+ON a.patient_id = b.patient_id;
+"""
+df_patient_biomarker = pd.read_sql_query(query, conn)
+print(df_patient_biomarker.describe())
+print(df_patient_biomarker.info())
+print(df_patient_biomarker['biomarker_name'].value_counts())
+print(df_patient_biomarker['test_result'].value_counts())
+print(df_patient_biomarker['biomarker_test_type'].value_counts())
+query = """
+SELECT patient_id,
+       max(HER2_flag) as HER2_flag
+FROM
+(
+SELECT *,
+       CASE
+        WHEN (biomarker_name = 'HER2' AND DATE(dod) >= test_date) 
+        THEN 1 
+        ELSE 0 
+       END AS HER2_flag
+FROM df_patient_biomarker
+)
+GROUP BY 1;
+"""
+df_HER2_test = ps.sqldf(query, locals())
+print(df_HER2_test.describe(include='all'))
+print(df_HER2_test.info())
+print(df_HER2_test['HER2_flag'].sum())
+print(df_HER2_test.describe(include='all'))
+print(df_HER2_test['patient_id'].count())
+
+
+# intent to test rate for HER2.
+percentage = (df_HER2_test['HER2_flag'].sum() / df_HER2_test['patient_id'].count()) * 100
+print(f"HER2 intent to Test Rate: {percentage:.2f}%")
+
+
+# tested rate for HER2.
+query = """
+SELECT patient_id,
+       max(HER2_valid_flag) as HER2_valid_flag
+FROM
+(
+SELECT *,
+       CASE
+        WHEN (biomarker_name = 'HER2' AND 
+              DATE(dod) >= test_date  AND 
+              test_result in ('Negative','Positive','Equivocal'))
+        THEN 1 
+        ELSE 0 
+       END AS HER2_valid_flag
+FROM df_patient_biomarker
+)
+GROUP BY 1;
+"""
+df_HER2_valid_test = ps.sqldf(query, locals())
+print(df_HER2_valid_test.info())
+print(df_HER2_valid_test['HER2_valid_flag'].sum())
+print(df_HER2_valid_test.describe(include='all'))
+print(df_HER2_valid_test['patient_id'].count())
+percentage = (df_HER2_valid_test['HER2_valid_flag'].sum()/df_HER2_valid_test['patient_id'].count())*100
+print(f"HER2 Test Rate: {percentage:.2f}%")
+
+
+# Calculate the negativity rate for HER2.
+query = """
+SELECT patient_id,
+       max(HER2_neg_flag) as HER2_neg_flag
+FROM
+(
+SELECT *,
+       CASE
+        WHEN (biomarker_name = 'HER2' AND 
+              DATE(dod) >= test_date  AND 
+              test_result in ('Negative'))
+        THEN 1 
+        ELSE 0 
+       END AS HER2_neg_flag
+FROM df_patient_biomarker
+)
+GROUP BY 1;
+"""
+df_HER2_neg_test = ps.sqldf(query, locals())
+print(df_HER2_neg_test.info())
+print(df_HER2_neg_test['HER2_neg_flag'].sum())
+print(df_HER2_neg_test.describe(include='all'))
+print(df_HER2_neg_test['patient_id'].count())
+percentage = (df_HER2_neg_test['HER2_neg_flag'].sum()/df_HER2_neg_test['patient_id'].count())*100
+print(f"HER2 Negative Test Rate: {percentage:.2f}%")
+
+
+
+#Survival time
+#    - Perform a statistical test to calculate the summary statistics for survival time stratifying patients by age at initial diagnosis of 60 years old .
+#    - Plot a Kaplan-Meier curve stratifying patients by age at initial diagnosis of 60 years old.
+
+query = """
+SELECT a.*, b.diagnosis_code, DATE(b.diagnosis_date) as diagnosis_date
+FROM patient a
+INNER JOIN diagnosis b
+ON a.patient_id = b.patient_id
+ORDER BY a.patient_id, b.diagnosis_date ASC;
+"""
+df_patients = pd.read_sql_query(query, conn)
+print(df_patients.info())
+print(df_patients.describe())
+
+
+
+query = """
+SELECT *
+FROM
+(
+Select *,
+       rank() OVER (PARTITION BY patient_id ORDER BY diagnosis_date ASC) AS rnk
+FROM df_patients 
+)
+WHERE rnk = 1
+"""
+df_patients_rank = ps.sqldf(query, locals())
+print(df_patients_rank.describe(include='all'))
+print(df_patients_rank.info())
+
+
+query = """
+SELECT *, CASE WHEN dob > dod THEN 1 ELSE 0 end as dob_anom,
+          CASE WHEN diagnosis_date > DATE(dod) THEN 1 ELSE 0 end as diag_anom
+FROM
+df_patients_rank
+WHERE dod < dob
+OR DATE(dod) < diagnosis_date
+"""
+
+
+df_dod_check = ps.sqldf(query, locals())
+print(df_dod_check.describe(include='all'))
+print(df_dod_check['diag_anom'].value_counts())
+print(df_dod_check['dob_anom'].value_counts())
+
+
+query = """
+SELECT *
+FROM
+df_patients_rank
+WHERE patient_id not in (SELECT distinct patient_id from df_dod_check);
+"""
+df_patients_dod_check = ps.sqldf(query, locals())
+print(df_patients_dod_check.describe(include='all'))
+
+
+query = """
+SELECT *,
+       diagnosis_date - DATE(dob) as Age
+       
+FROM
+df_patients_dod_check;
+"""
+
+
+df_patients_age = ps.sqldf(query, locals())
+print(df_patients_age.describe(include='all'))
+print(df_patients_age['Age'].describe())
+
+
+!pip install matplotlib 
+!pip install seaborn
+!pip install lifelines
+import matplotlib.pyplot as plt
+from lifelines import KaplanMeierFitter
+from lifelines.statistics import logrank_test
+
+
+print(df_patients_age.info())
+print(df_patients_age.describe(include='all'))
+
+
+#Create the Survival time to event variable
+query = """
+SELECT *,
+        (DATE(dod) - diagnosis_date)*12 as pt_survival_time,
+        CASE WHEN DATE(dod) IS NOT NULL THEN 1 ELSE 0 END AS event
+
+FROM df_patients_age;
+"""
+df_patient_survival = ps.sqldf(query, locals())
+print(df_patient_survival.info())
+print(df_patient_survival.describe(include = 'all'))
+print(df_patient_survival['event'].value_counts())
+print(df_patient_survival['pt_survival_time'].describe())
+print(df_patient_survival['pt_survival_time'].info())
+plt.figure(figsize=(8, 5))
+sns.histplot(df_patient_survival['pt_survival_time'], bins=30, kde=True)
+plt.title("Patient Survival")
+plt.xlabel("Survival Time (Month)")
+plt.ylabel("Patients")
+plt.show()
+
+
+# Convert survival_time_months to float
+df_patient_survival['pt_survival_time'] = df_patient_survival['pt_survival_time'].fillna(0)
+# Filter patients into two age groups
+age_60_below = df_patient_survival[df_patient_survival['Age'] < 60].copy()
+age_60_above = df_patient_survival[df_patient_survival['Age'] >= 60].copy()
+print(age_60_below['pt_survival_time'].describe())
+plt.figure(figsize=(8, 5))
+sns.histplot(age_60_below['pt_survival_time'], bins=30, kde=True)
+plt.title("Patient Survival for Age below 60")
+plt.xlabel("Survival Time (Month)")
+plt.ylabel("Patients")
+plt.show()
+
+
+
+print(age_60_above['pt_survival_time'].describe())
+plt.figure(figsize=(8, 5))
+sns.histplot(age_60_above['pt_survival_time'], bins=30, kde=True)
+plt.title("Patient Survival for Age at or above 60")
+plt.xlabel("Survival Time (Month)")
+plt.ylabel("Patients")
+plt.show()
+
+
+
+# Kaplan-Meier Curve
+kmf = KaplanMeierFitter()
+plt.figure(figsize=(8, 5))
+
+for group, df in df_patient_survival.groupby(df_patient_survival['Age'] >= 60):
+    label = "Age >= 60" if group else "Age < 60"
+    kmf.fit(df['pt_survival_time'], event_observed=df['event'], label=label)
+    kmf.plot()
+
+plt.title("Kaplan-Meier Survival Curve by Age Group")
+plt.xlabel("Months")
+plt.ylabel("Survival Probability")
+plt.show()
+
+
+
+# Comparing median survival
+# Median survival time for Age < 60
+kmf.fit(age_60_below['pt_survival_time'], event_observed=age_60_below['event'])
+median_survival_below_60 = kmf.median_survival_time_
+
+# Median survival time for Age ≥ 60
+kmf.fit(age_60_above['pt_survival_time'], event_observed=age_60_above['event'])
+median_survival_above_60 = kmf.median_survival_time_
+
+print(f"Median Survival (Age < 60): {median_survival_below_60:.2f} months")
+print(f"Median Survival (Age ≥ 60): {median_survival_above_60:.2f} months")
+
+
+# Log-Rank Test for Survival Difference
+results = logrank_test(age_60_below['pt_survival_time'], age_60_above['pt_survival_time'],
+                       event_observed_A=age_60_below['event'],
+                       event_observed_B=age_60_above['event'])
+print(f"Log-Rank Test p-value: {results.p_value:.4f}")
+
+
+
+
+
+
+
+
+# All answers
+#1. Data maturity 
+#    - Calculate the summary statistics and plot the distribution of follow up time for BC patients.
+#    - Calculate the summary statistics and plot the distribution of age at initial diagnosis for BC patients
+#
+#2. HER2 status
+#    - Calculate the intent to test rate for HER2. 
+#    - Calculate the tested rate for HER2.
+#    - Calculate the negativity rate for HER2.
+#
+#3. Survival time
+#    - Perform a statistical test to calculate the summary statistics for survival time stratifying patients by age at initial diagnosis of 60 years old .
+#    - Plot a Kaplan-Meier curve stratifying patients by age at initial diagnosis of 60 years old.
+#1 -- Calculate the summary statistics and plot the distribution of follow up time for BC patients.
+print(df_followup_time['followup_time'].describe())
+plt.figure(figsize=(8, 5))
+sns.histplot(df_followup_time['followup_time'], bins=30, kde=True)
+plt.title("Distribution of followup time Variable")
+plt.xlabel("Followup time (months)")
+plt.ylabel("Patients")
+plt.show()
+#1 -- Calculate the summary statistics and plot the distribution of age at initial diagnosis for BC patients
+print(df_age['Age'].describe())
+plt.figure(figsize=(8, 5))
+sns.histplot(df_age['Age'], bins=30, kde=True)
+plt.title("Distribution of Age")
+plt.xlabel("Age (Years)")
+plt.ylabel("Patients")
+plt.show()
+#2. HER2 status   - Calculate the intent to test rate for HER2.
+percentage = (df_HER2_test['HER2_flag'].sum() / df_HER2_test['patient_id'].count()) * 100
+print(f"HER2 intent to Test Rate: {percentage:.2f}%")
+#2. HER2 status - Calculate the tested rate for HER2.
+percentage = (df_HER2_valid_test['HER2_valid_flag'].sum()/df_HER2_valid_test['patient_id'].count())*100
+print(f"HER2 Test Rate: {percentage:.2f}%")
+#2. HER2 status  - Calculate the negativity rate for HER2.
+percentage = (df_HER2_neg_test['HER2_neg_flag'].sum()/df_HER2_neg_test['patient_id'].count())*100
+print(f"HER2 Negative Test Rate: {percentage:.2f}%")
+#3. Survival time - Perform a statistical test to calculate the summary statistics 
+#                   for survival time stratifying patients by age at initial diagnosis of 60 years old .
+print(age_60_below['pt_survival_time'].describe())
+plt.figure(figsize=(8, 5))
+sns.histplot(age_60_below['pt_survival_time'], bins=30, kde=True)
+plt.title("Patient Survival for Age below 60")
+plt.xlabel("Survival Time (Month)")
+plt.ylabel("Patients")
+plt.show()
+print(age_60_above['pt_survival_time'].describe())
+plt.figure(figsize=(8, 5))
+sns.histplot(age_60_above['pt_survival_time'], bins=30, kde=True)
+plt.title("Patient Survival for Age at and above 60")
+plt.xlabel("Survival Time (Month)")
+plt.ylabel("Patients")
+plt.show()
+
+
+#3. Survival time - Plot a Kaplan-Meier curve stratifying patients by age at initial diagnosis of 60 years old.
+# Kaplan-Meier Curve
+kmf = KaplanMeierFitter()
+plt.figure(figsize=(8, 5))
+
+for group, df in df_patient_survival.groupby(df_patient_survival['Age'] >= 60):
+    label = "Age >= 60" if group else "Age < 60"
+    kmf.fit(df['pt_survival_time'], event_observed=df['event'], label=label)
+    kmf.plot()
+
+plt.title("Kaplan-Meier Survival Curve by Age Group")
+plt.xlabel("Months")
+plt.ylabel("Survival Probability")
+plt.show()
