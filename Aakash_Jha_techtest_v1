@@ -43,6 +43,9 @@ print(df_biomarker.isnull().sum())
 print(df_patient.describe())
 print(df_diagnosis.describe())
 print(df_biomarker.describe())
+
+
+
 # Let's start
 # 1. Data maturity 
 #    - Calculate the summary statistics and plot the distribution of follow up time for BC patients.
@@ -166,7 +169,7 @@ GROUP BY 1;
 df_last_encounter_final = ps.sqldf(query, locals())
 print(df_last_encounter_final.describe(include='all'))
 print(df_last_encounter_final['last_encounter_dod'].value_counts().sort_index())
-print(df_last_encounter_final)
+print(df_last_encounter_final.info())
 
 
 # Joining the last encounter to our final table post exclusions and calculating followup period
